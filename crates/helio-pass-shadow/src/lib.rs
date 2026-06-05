@@ -549,6 +549,31 @@ impl RenderPass for ShadowPass {
             return Ok(());
         }
 
+        // ── TEMP diagnostic: what does a shadow-update frame actually do? ─────
+        // Set HELIO_SHADOW_DEBUG=1 and drag a light. Tells us whether the cost
+        // is geometry (high draw counts × many faces) or structural (few faces,
+        // few draws, but still slow ⇒ a stall on the 1 GB atlas). Zero cost off.
+        {
+            use std::sync::OnceLock;
+            static SHADOW_DEBUG: OnceLock<bool> = OnceLock::new();
+            let enabled = *SHADOW_DEBUG.get_or_init(|| std::env::var("HELIO_SHADOW_DEBUG").is_ok());
+            if enabled {
+                let light_faces = render_face.iter().filter(|&&r| r).count();
+                eprintln!(
+                    "[shadow] faces={} casters={} | light_faces={} need_static={} objects_moved={} \
+                     | static_draws={} movable_draws={} multi_draw_count_support={}",
+                    face_count,
+                    caster_count,
+                    light_faces,
+                    need_static,
+                    objects_moved,
+                    static_draw_count,
+                    movable_draw_count,
+                    self.supports_multi_draw_count,
+                );
+            }
+        }
+
         let main_scene = ctx.resources.main_scene.as_ref().ok_or_else(|| {
             helio_v3::Error::InvalidPassConfig("ShadowPass requires main_scene".into())
         })?;
