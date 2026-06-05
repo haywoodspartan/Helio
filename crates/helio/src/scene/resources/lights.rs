@@ -68,12 +68,16 @@ impl super::super::Scene {
         });
         let pushed = self.gpu_scene.lights.push(light);
         debug_assert_eq!(pushed, dense_index);
-        
+
+        // The movable set changed → flush() must rebuild the compacted runtime
+        // lights buffer and re-assign shadow-caster slots.
+        self.light_set_dirty = true;
+
         // Invalidate any previous bake if this is a static/stationary light
         if !movability.can_move() {
             self.bake_invalidated = true;
         }
-        
+
         id
     }
 
@@ -103,39 +107,77 @@ impl super::super::Scene {
     /// scene.update_light(light_id, light)?;
     /// ```
     pub fn update_light(&mut self, id: LightId, light: GpuLight) -> Result<()> {
-        let Some((dense_index, record)) = self.lights.get_mut_with_index(id) else {
-            return Err(invalid("light"));
+        // Update the arena record and capture the Copy values we need, ending the
+        // `&mut self.lights` borrow before touching `self.gpu_scene` / dirty flags.
+        let (dense_index, old) = {
+            let Some((dense_index, record)) = self.lights.get_mut_with_index(id) else {
+                return Err(invalid("light"));
+            };
+            let old = record.gpu;
+
+            if !record.movability.can_move() {
+                // Static lights cannot move; reject position/direction edits.
+                // Other edits update only the stored record — static lights are
+                // baked and never enter the runtime (movable) lights buffer, so
+                // there is nothing to upload and no shadow-budget impact.
+                let position_changed = old.position_range != light.position_range;
+                let direction_changed = old.direction_outer != light.direction_outer;
+                if position_changed || direction_changed {
+                    log::warn!(
+                        "Attempted to update position/direction on Static light {:?}. Set movability to Movable to allow updates.",
+                        id
+                    );
+                    return Ok(()); // No-op instead of error
+                }
+                record.gpu = light;
+                return Ok(());
+            }
+
+            record.gpu = light;
+            (dense_index, old)
         };
-        // Enforce movability: Static lights cannot have position/direction updated
-        if !record.movability.can_move() {
-            let old_pos = record.gpu.position_range;
-            let new_pos = light.position_range;
-            let old_dir = record.gpu.direction_outer;
-            let new_dir = light.direction_outer;
 
-            // Check if position or direction changed
-            let position_changed = old_pos != new_pos;
-            let direction_changed = old_dir != new_dir;
+        // Movable light data changed → bump the generation counter so shadow
+        // caching (per-caster hashes) and any lights_gen-keyed pass re-evaluate.
+        self.movable_lights_generation = self.movable_lights_generation.wrapping_add(1);
+        self.gpu_scene.movable_lights_generation = self.movable_lights_generation;
 
-            if position_changed || direction_changed {
-                log::warn!(
-                    "Attempted to update position/direction on Static light {:?}. Set movability to Movable to allow updates.",
-                    id
-                );
-                return Ok(()); // No-op instead of error
+        // A change to a score-relevant field (importance = intensity × range²) or
+        // to the shadow-enable flag changes the 42-caster budget, so force a full
+        // rebuild + re-score on the next flush.  A pure position/direction drag
+        // changes neither, and takes the in-place fast path below.
+        let score_changed = old.color_intensity[3] != light.color_intensity[3]
+            || old.position_range[3] != light.position_range[3];
+        let shadow_enable_changed =
+            (old.shadow_index == u32::MAX) != (light.shadow_index == u32::MAX);
+        if score_changed || shadow_enable_changed {
+            self.light_set_dirty = true;
+            return Ok(());
+        }
+
+        // A full rebuild is already pending — flush() will read the fresh arena
+        // data, so skip the incremental write (movable_slot_of may be stale).
+        if self.light_set_dirty {
+            return Ok(());
+        }
+
+        // Fast path: position/direction-only change.  Patch the single compacted
+        // slot in place, preserving the GPU-assigned `shadow_index` (the arena /
+        // caller copy carries the *request* value, not the assigned atlas slot).
+        if let Some(&slot) = self.movable_slot_of.get(dense_index) {
+            let slot = slot as usize;
+            if slot < self.gpu_scene.lights.len() {
+                let assigned_shadow = self.gpu_scene.lights.0.as_slice()[slot].shadow_index;
+                let mut g = light;
+                g.shadow_index = assigned_shadow;
+                let updated = self.gpu_scene.lights.update(slot, g);
+                debug_assert!(updated);
+                return Ok(());
             }
         }
-        record.gpu = light;
 
-        // Increment generation counter for movable lights (for shadow cache invalidation)
-        // Only increment if the light can actually move
-        if record.movability.can_move() {
-            self.movable_lights_generation += 1;
-            self.gpu_scene.movable_lights_generation = self.movable_lights_generation;
-        }
-
-        let updated = self.gpu_scene.lights.update(dense_index, light);
-        debug_assert!(updated);
+        // Mapping missing/stale (e.g. before the first flush) → force a rebuild.
+        self.light_set_dirty = true;
         Ok(())
     }
 
@@ -165,6 +207,11 @@ impl super::super::Scene {
         let removed = self.lights.remove(id).ok_or_else(|| invalid("light"))?;
         let gpu_removed = self.gpu_scene.lights.swap_remove(removed.dense_index);
         debug_assert!(gpu_removed.is_some());
+
+        // The movable set changed → flush() must rebuild the compacted runtime
+        // lights buffer and re-assign shadow-caster slots.
+        self.light_set_dirty = true;
+
         Ok(())
     }
 }

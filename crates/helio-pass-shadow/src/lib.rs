@@ -63,6 +63,22 @@ const SHADOW_RES: u32 = 1024;
 /// guaranteed to be ≤ 256 on every wgpu backend (Metal, Vulkan, DX12, WebGPU).
 const FACE_BUF_STRIDE: u64 = 256;
 
+/// Cube faces per point-light caster.
+const FACES_PER_CASTER: usize = 6;
+
+/// Maximum shadow faces re-rendered *per caster per frame* due to LIGHT movement.
+///
+/// Re-rendering a moved light costs up to 6 cube faces × (all static + all
+/// movable shadow geometry) — doing all 6 every frame is the dominant cost of
+/// dragging a light in the editor.  Capping to 1 face/frame spreads a caster's
+/// 6 faces across 6 frames (round-robin), giving a hard 6× reduction in
+/// per-frame shadow cost that is robust to *any* movement pattern (continuous
+/// drag, bursty mouse events, single nudge).  The faces lag the light by up to
+/// 6 frames during fast motion and fully converge ~100 ms after it settles.
+///
+/// Raise to 2 to halve convergence latency at 2× the per-frame cost.
+const MAX_LIGHT_FACES_PER_FRAME: usize = 1;
+
 // ── Pass struct ───────────────────────────────────────────────────────────────
 
 pub struct ShadowPass {
@@ -108,10 +124,17 @@ pub struct ShadowPass {
     /// Used as indirect draw count for movable geometry (`multi_draw_indexed_indirect_count`).
     face_geom_count_buf: Arc<wgpu::Buffer>,
 
-    // ── Per-caster CPU dirty tracking (light movement only) ──────────────────
-    /// Per-caster last-rendered generation, compared against `per_caster_dirty_gen`.
-    /// Only updated when a light moves (object movement is now detected GPU-side).
-    per_caster_last_gen: [u64; 42],
+    // ── Per-face light-movement amortisation ─────────────────────────────────
+    // `face_light_gen[f]` is the per-caster dirty-gen that face f was last
+    // rendered at (for LIGHT movement; object movement is GPU-driven separately).
+    // A face whose stored gen differs from its caster's current
+    // `per_caster_dirty_gen` is "stale" and needs re-rendering.  Each frame we
+    // re-render at most `MAX_LIGHT_FACES_PER_FRAME` stale faces per caster,
+    // chosen round-robin via `caster_rr_cursor`, so a moved light's six faces
+    // are spread across frames instead of all re-rendering at once.
+    face_light_gen: [u64; MAX_SHADOW_FACES],
+    /// Next cube face (0..6) to consider first when amortising a caster's faces.
+    caster_rr_cursor: [u8; 42],
 
     /// Total shadow count at last render.  Detects caster topology changes.
     last_rendered_shadow_count: u32,
@@ -428,7 +451,8 @@ impl ShadowPass {
             compare_sampler,
             face_dirty_buf,
             face_geom_count_buf,
-            per_caster_last_gen: [0u64; 42],
+            face_light_gen: [0u64; MAX_SHADOW_FACES],
+            caster_rr_cursor: [0u8; 42],
             last_rendered_shadow_count: 0,
             last_movable_objects_gen: u64::MAX,
             supports_multi_draw_count: device
@@ -463,7 +487,8 @@ impl RenderPass for ShadowPass {
         let movable_draw_count = ctx.scene.shadow_movable_draw_count;
 
         if face_count == 0 {
-            self.per_caster_last_gen = [0u64; 42];
+            self.face_light_gen = [0u64; MAX_SHADOW_FACES];
+            self.caster_rr_cursor = [0u8; 42];
             self.last_rendered_shadow_count = 0;
             self.static_atlas_cache_gen = None;
             self.last_movable_objects_gen = u64::MAX;
@@ -477,14 +502,42 @@ impl RenderPass for ShadowPass {
         let need_static = self.static_atlas_cache_gen != Some(static_gen)
             || shadow_count != self.last_rendered_shadow_count;
 
-        // Per-caster dirty check for LIGHT movement only.
+        // Per-face dirty check for LIGHT movement only, amortised.
         // Object-movement dirtiness is handled GPU-side via face_geom_count_buf.
-        let mut dirty_casters = [false; 42];
-        let mut any_dirty_caster = false;
+        //
+        // `render_face[f]` = re-render atlas face f this frame because its caster's
+        // light moved and face f is stale (its stored gen differs from the
+        // caster's current dirty-gen).  We re-render at most
+        // MAX_LIGHT_FACES_PER_FRAME stale faces per caster, chosen round-robin,
+        // so a moved light's six faces spread across frames instead of all six
+        // re-rendering at once.  This is robust to bursty/continuous drag alike:
+        // each frame costs ≤ 1 face per moving caster, period.
+        let mut render_face = [false; MAX_SHADOW_FACES];
+        let mut any_light_render = false;
         for slot in 0..caster_count {
-            if ctx.scene.per_caster_dirty_gen[slot] != self.per_caster_last_gen[slot] {
-                dirty_casters[slot] = true;
-                any_dirty_caster = true;
+            let desired = ctx.scene.per_caster_dirty_gen[slot];
+            let mut rendered = 0usize;
+            for step in 0..FACES_PER_CASTER {
+                if rendered >= MAX_LIGHT_FACES_PER_FRAME {
+                    break;
+                }
+                let f = (self.caster_rr_cursor[slot] as usize + step) % FACES_PER_CASTER;
+                let face = slot * FACES_PER_CASTER + f;
+                if face >= face_count {
+                    continue;
+                }
+                if self.face_light_gen[face] != desired {
+                    render_face[face] = true;
+                    self.face_light_gen[face] = desired;
+                    any_light_render = true;
+                    rendered += 1;
+                }
+            }
+            // Rotate the starting face so continuous motion cycles all six faces
+            // (otherwise the same low-index faces would always win the budget).
+            if rendered > 0 {
+                self.caster_rr_cursor[slot] =
+                    ((self.caster_rr_cursor[slot] as usize + rendered) % FACES_PER_CASTER) as u8;
             }
         }
 
@@ -492,7 +545,7 @@ impl RenderPass for ShadowPass {
         let objects_moved =
             ctx.scene.movable_objects_generation != self.last_movable_objects_gen;
 
-        if !need_static && !any_dirty_caster && !objects_moved {
+        if !need_static && !any_light_render && !objects_moved {
             return Ok(());
         }
 
@@ -538,12 +591,11 @@ impl RenderPass for ShadowPass {
         let pipeline = &self.pipeline;
 
         // ── Static atlas render ────────────────────────────────────────────────
-        if need_static || any_dirty_caster {
+        if need_static || any_light_render {
             let static_indirect = ctx.scene.shadow_static_indirect;
             if static_draw_count > 0 {
                 for face in 0..face_count {
-                    let caster_slot = face / 6;
-                    if !need_static && (caster_slot >= 42 || !dirty_casters[caster_slot]) {
+                    if !need_static && !render_face[face] {
                         continue;
                     }
                     let face_view = &self.static_face_views[face];
@@ -605,9 +657,10 @@ impl RenderPass for ShadowPass {
         //
         // Two dirty sources with different handling:
         //
-        //   Light movement (any_dirty_caster = true):
-        //     Full clear + all movable draws, CPU-driven.  Light movement is rare
-        //     (typically < 5 lights) so this path is O(6) render passes per light.
+        //   Light movement (render_face[f] = true):
+        //     Full clear + all movable draws, CPU-driven.  Amortised round-robin
+        //     (see render_face computation) caps this to one face per dragging
+        //     caster per frame.
         //
         //   Object movement (objects_moved = true):
         //     LoadOp::Load (preserve cached atlas) + GPU-clear triangle (only for dirty
@@ -616,12 +669,11 @@ impl RenderPass for ShadowPass {
         //     so multi_draw_{indirect,indexed_indirect}_count suppresses all work on
         //     clean faces.  The loop runs for all active faces but clean faces produce
         //     a near-zero-cost render pass (LoadOp::Load with 0 GPU draws).
-        if any_dirty_caster || objects_moved {
+        if any_light_render || objects_moved {
             let movable_indirect = ctx.scene.shadow_movable_indirect;
 
             for face in 0..face_count {
-                let caster_slot  = face / 6;
-                let light_dirty  = caster_slot < 42 && dirty_casters[caster_slot];
+                let light_dirty  = render_face[face];
                 let face_view    = &self.face_views[face];
                 let dyn_offset   = (face as u64 * FACE_BUF_STRIDE) as u32;
 
@@ -740,13 +792,8 @@ impl RenderPass for ShadowPass {
                 }
             }
 
-            // Update per-caster gen tracking (light movement only).
-            for slot in 0..caster_count {
-                if dirty_casters[slot] {
-                    self.per_caster_last_gen[slot] = ctx.scene.per_caster_dirty_gen[slot];
-                }
-            }
-
+            // `face_light_gen` is advanced inline when each face is selected for
+            // re-render above, so no per-caster reconciliation is needed here.
             self.last_movable_objects_gen = ctx.scene.movable_objects_generation;
         }
 

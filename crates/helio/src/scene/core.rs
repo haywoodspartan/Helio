@@ -102,6 +102,31 @@ pub struct Scene {
     /// Used by shadow caching to detect when Movable lights move.
     pub(in crate::scene) movable_lights_generation: u64,
 
+    // ── Light flush incrementalisation ─────────────────────────────────────
+    // The runtime lights buffer holds only *movable* lights, compacted.  It is
+    // expensive to rebuild from scratch (full GPU re-upload) and to re-score
+    // (O(N log N) sort) every frame, yet during a position drag neither the
+    // membership nor the importance score (`intensity × range²`) changes.
+    //
+    // `light_set_dirty` gates the rebuild + re-score: it is set only when the
+    // movable set changes (insert/remove) or a light's score-relevant fields
+    // (intensity, range, shadow-enable) change.  Pure position/direction moves
+    // skip both blocks and instead patch the one changed light into its slot.
+    /// True when the compacted movable-lights buffer + shadow-caster assignment
+    /// must be fully rebuilt on the next `flush()`.
+    pub(in crate::scene) light_set_dirty: bool,
+    /// Maps a light's arena dense index → its slot in the compacted movable
+    /// lights buffer (`u32::MAX` = not movable / not present).  Rebuilt whenever
+    /// the movable set is rebuilt; lets `update_light` patch a single slot.
+    pub(in crate::scene) movable_slot_of: Vec<u32>,
+    /// `movable_lights_generation` at the last per-caster-hash recompute.
+    pub(in crate::scene) flush_light_hash_gen: Option<u64>,
+    /// Snapped camera position at the last per-caster-hash recompute (directional
+    /// caster hashes fold in the camera, so a camera move must re-hash them).
+    pub(in crate::scene) flush_light_cam_pos: [f32; 3],
+    /// Snapped camera forward at the last per-caster-hash recompute.
+    pub(in crate::scene) flush_light_cam_fwd: [f32; 3],
+
     /// Per-frame custom trait-based scene actors.
     pub(in crate::scene) custom_actors: Vec<Box<dyn SceneActorTrait>>,
 
@@ -271,6 +296,11 @@ impl Scene {
             group_hidden: GroupMask::NONE,
             movable_objects_generation: 0,
             movable_lights_generation: 0,
+            light_set_dirty: true,           // build movable set + scoring on first flush
+            movable_slot_of: Vec::new(),
+            flush_light_hash_gen: None,      // force per-caster hash on first flush
+            flush_light_cam_pos: [f32::NAN; 3],
+            flush_light_cam_fwd: [f32::NAN; 3],
             custom_actors: Vec::new(),
             vg_meshes: HashMap::new(),
             vg_next_mesh_id: 0,
@@ -494,166 +524,41 @@ impl Scene {
     /// renderer.render(&scene, target)?;
     /// ```
     pub fn flush(&mut self) {
-        // ── Rebuild lights buffer to only contain movable lights ─────────────
-        // Static/stationary lights are baked and should not contribute to real-time lighting.
-        // This dramatically improves performance when scenes have many baked lights.
-        {
-            let light_rec_count = self.lights.dense_len();
-            let mut movable_lights: Vec<GpuLight> = Vec::with_capacity(light_rec_count);
-            
-            for i in 0..light_rec_count {
-                if let Some(record) = self.lights.get_dense(i) {
-                    if record.movability.can_move() {
-                        movable_lights.push(record.gpu);
-                    }
-                }
-            }
-            
-            // Replace the lights buffer with only movable lights
-            self.gpu_scene.lights.set_data(movable_lights.clone());
-            self.gpu_scene.movable_light_count = movable_lights.len() as u32;
-            
-            if movable_lights.len() < light_rec_count {
-                log::trace!(
-                    "[helio] Filtered lights for runtime: {} movable, {} static/stationary (baked)",
-                    movable_lights.len(),
-                    light_rec_count - movable_lights.len()
-                );
-            }
-        }
-        
-        // Assign shadow atlas slots to the highest-importance shadow-casting lights.
-        //
-        // Problem with sequential assignment: the first N lights inserted always win the
-        // 42-caster budget, regardless of how far away or how dim they are. A bright
-        // close light inserted after slot 42 is full gets no shadow.
-        //
-        // Solution — two-phase importance selection:
-        //   Phase 1: Score every shadow-requesting light by VIEW-INDEPENDENT importance:
-        //              intensity × range²
-        //            Directional lights always score ∞ (global, never culled).
-        //            Sort descending → top 42 are the frame's active casters.
-        //   Phase 2: Re-sort the WINNERS by their GPU buffer index (stable secondary key).
-        //            Same lights that were in budget last frame keep the same atlas slots,
-        //            preventing slot churn from minor score fluctuations. Only new entrants
-        //            and exits cause slot reassignment (and thus dirty-gen bumps).
-        //
-        // IMPORTANT: Camera distance is intentionally NOT used in scoring. Using camera
-        // distance causes the budget to reshuffle every frame the camera moves, which
-        // triggers shadow atlas re-renders (expensive with many draw calls). The budget
-        // should only change when lights are added/removed or their properties change.
-        {
-            const MAX_SHADOW_CASTERS: usize = 42;
-            const FACES_PER_LIGHT: u32 = 6;
-            let light_count = self.gpu_scene.lights.len();
+        const DIRECTIONAL_CAMERA_SNAP_METERS: f32 = 0.25;
+        const DIRECTIONAL_FORWARD_SNAP: f32 = 1.0 / 1024.0;
 
-            // Phase 1: score and select the top MAX_SHADOW_CASTERS.
-            let mut scored: Vec<(f32, usize)> = Vec::with_capacity(light_count);
-            for i in 0..light_count {
-                let light = self.gpu_scene.lights.0.as_slice()[i];
-                if light.shadow_index == u32::MAX {
-                    continue; // user explicitly disabled shadows on this light
-                }
-                let score = if light.light_type == 0 {
-                    // Directional: infinite range, always highest priority.
-                    f32::MAX
-                } else {
-                    let range = light.position_range[3].max(0.001);
-                    // intensity × range² — view-independent, stable across camera moves.
-                    // Larger/brighter lights win the budget regardless of camera position.
-                    light.color_intensity[3] * (range * range)
-                };
-                scored.push((score, i));
-            }
-
-            // Sort descending by importance to determine which lights win the budget.
-            scored.sort_unstable_by(|a, b| {
-                b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            let winner_count = scored.len().min(MAX_SHADOW_CASTERS);
-
-            // Phase 2: re-sort winners by their buffer index (stable secondary key).
-            // Lights that stay in budget from frame to frame retain the same atlas slot,
-            // keeping per-caster dirty gens stable and avoiding spurious re-renders.
-            scored[..winner_count].sort_unstable_by_key(|&(_, i)| i);
-
-            // Assign atlas slots to winners; disable everything else.
-            let mut next_layer: u32 = 0;
-            for (rank, &(_, i)) in scored.iter().enumerate() {
-                let light = self.gpu_scene.lights.0.as_slice()[i];
-                if rank < MAX_SHADOW_CASTERS {
-                    let mut assigned = light;
-                    assigned.shadow_index = next_layer;
-                    self.gpu_scene.lights.update(i, assigned);
-                    next_layer += FACES_PER_LIGHT;
-                } else {
-                    let mut disabled = light;
-                    disabled.shadow_index = u32::MAX;
-                    self.gpu_scene.lights.update(i, disabled);
-                }
-            }
-            let needed = (next_layer as usize).max(1);
-            if self.gpu_scene.shadow_matrices.len() != needed {
-                self.gpu_scene
-                    .shadow_matrices
-                    .set_data(vec![GpuShadowMatrix::zeroed(); needed]);
-            }
+        // ── Movable-light filter + shadow-caster assignment (gated) ──────────
+        // These two blocks are pure functions of the *movable light set* and each
+        // light's *score-relevant* fields (intensity, range, shadow-enable).  A
+        // pure position/direction drag changes none of those — `update_light`
+        // patches the moved light's slot directly and leaves `light_set_dirty`
+        // clear, so we skip the full rebuild + O(N log N) re-score entirely.
+        let rebuilt_light_set = self.light_set_dirty;
+        if rebuilt_light_set {
+            self.light_set_dirty = false;
+            self.rebuild_movable_lights();
+            self.assign_shadow_casters();
         }
 
-        // ── Per-caster shadow dirty tracking ─────────────────────────────────
-        // Compute a content hash per shadow caster. Each hash covers:
-        //   • The caster light's own geometry (position, range, direction).
-        //   • All movable objects whose bounding sphere overlaps the light's range.
-        // Directional lights always include every movable object (infinite range).
-        // Casters whose hash differs from last frame bump their dirty gen counter;
-        // ShadowPass then re-renders only those casters' atlas faces.
-        {
-            let light_count = self.gpu_scene.lights.len();
-            let mut new_hashes = [0u64; 42];
-
-            // Pass 1: hash each shadow-casting light's geometry into its slot.
-            for i in 0..light_count {
-                let light = self.gpu_scene.lights.0.as_slice()[i];
-                if light.shadow_index == u32::MAX {
-                    continue;
-                }
-                let slot = (light.shadow_index / 6) as usize;
-                if slot >= 42 {
-                    continue;
-                }
-                let base_hash = fnv1a_f32s(&light.position_range)
-                    ^ fnv1a_f32s(&light.direction_outer)
-                    ^ (light.light_type as u64).wrapping_mul(2654435761);
-                // Directional CSM depends on the camera frustum, but the GPU matrix pass
-                // already texel-snaps cascade placement. Mirror that coarseness here so
-                // sub-texel camera motion does not thrash the cached shadow atlas.
-                new_hashes[slot] = if light.light_type == 0 {
-                    const DIRECTIONAL_CAMERA_SNAP_METERS: f32 = 0.25;
-                    const DIRECTIONAL_FORWARD_SNAP: f32 = 1.0 / 1024.0;
-
-                    let snapped_cam_pos = quantize_f32s(
-                        self.gpu_scene.camera.position(),
-                        DIRECTIONAL_CAMERA_SNAP_METERS,
-                    );
-                    let snapped_cam_forward = quantize_f32s(
-                        self.gpu_scene.camera.forward(),
-                        DIRECTIONAL_FORWARD_SNAP,
-                    );
-
-                    base_hash
-                        ^ fnv1a_f32s(&snapped_cam_pos)
-                        ^ fnv1a_f32s(&snapped_cam_forward)
-                } else {
-                    base_hash
-                };
-            }
-
-            // Write light-geometry hash to per_caster_dirty_gen.
-            // ShadowPass detects light movement each frame by comparing this value.
-            for slot in 0..42usize {
-                self.gpu_scene.per_caster_dirty_gen[slot] = new_hashes[slot];
-            }
+        // ── Per-caster shadow dirty tracking (gated) ─────────────────────────
+        // Recompute the per-caster content hashes only when something they depend
+        // on changed: any movable light's data (tracked by the generation counter),
+        // the camera (directional caster hashes fold in a snapped camera pose), or
+        // a set rebuild (which may have reassigned caster→slot mappings — insert
+        // does not bump the generation counter, so check `rebuilt_light_set` too).
+        // On a fully static frame the hashes are unchanged, so ShadowPass sees the
+        // same dirty-gen and does no work.
+        let cam_pos = quantize_f32s(self.gpu_scene.camera.position(), DIRECTIONAL_CAMERA_SNAP_METERS);
+        let cam_fwd = quantize_f32s(self.gpu_scene.camera.forward(), DIRECTIONAL_FORWARD_SNAP);
+        let hash_inputs_changed = rebuilt_light_set
+            || self.flush_light_hash_gen != Some(self.movable_lights_generation)
+            || self.flush_light_cam_pos != cam_pos
+            || self.flush_light_cam_fwd != cam_fwd;
+        if hash_inputs_changed {
+            self.recompute_caster_hashes(cam_pos, cam_fwd);
+            self.flush_light_hash_gen = Some(self.movable_lights_generation);
+            self.flush_light_cam_pos = cam_pos;
+            self.flush_light_cam_fwd = cam_fwd;
         }
 
         let queue = self.gpu_scene.queue.clone();
@@ -682,6 +587,153 @@ impl Scene {
             self.vg_objects_dirty = false;
         }
         self.gpu_scene.flush();
+    }
+
+    /// Rebuild the compacted movable-lights GPU buffer and the
+    /// `movable_slot_of` dense-index → buffer-slot map.
+    ///
+    /// Static/stationary lights are baked, so the runtime lighting buffer holds
+    /// only movable lights.  Called from `flush()` only when the movable set may
+    /// have changed (`light_set_dirty`).  `update_light` patches a single slot
+    /// in-place between rebuilds via `movable_slot_of`.
+    fn rebuild_movable_lights(&mut self) {
+        let light_rec_count = self.lights.dense_len();
+        self.movable_slot_of.clear();
+        self.movable_slot_of.resize(light_rec_count, u32::MAX);
+
+        let mut movable_lights: Vec<GpuLight> = Vec::with_capacity(light_rec_count);
+        for i in 0..light_rec_count {
+            if let Some(record) = self.lights.get_dense(i) {
+                if record.movability.can_move() {
+                    self.movable_slot_of[i] = movable_lights.len() as u32;
+                    movable_lights.push(record.gpu);
+                }
+            }
+        }
+
+        let movable_count = movable_lights.len();
+        // set_data takes ownership — no clone needed.
+        self.gpu_scene.lights.set_data(movable_lights);
+        self.gpu_scene.movable_light_count = movable_count as u32;
+
+        if movable_count < light_rec_count {
+            log::trace!(
+                "[helio] Filtered lights for runtime: {} movable, {} static/stationary (baked)",
+                movable_count,
+                light_rec_count - movable_count
+            );
+        }
+    }
+
+    /// Assign shadow atlas slots to the highest-importance shadow-casting lights.
+    ///
+    /// Problem with sequential assignment: the first N lights inserted always win
+    /// the 42-caster budget, regardless of how far away or how dim they are. A
+    /// bright close light inserted after slot 42 is full gets no shadow.
+    ///
+    /// Solution — two-phase importance selection:
+    ///   Phase 1: Score every shadow-requesting light by VIEW-INDEPENDENT
+    ///            importance: `intensity × range²`.  Directional lights always
+    ///            score ∞ (global, never culled).  Sort descending → top 42 are
+    ///            the frame's active casters.
+    ///   Phase 2: Re-sort the WINNERS by their GPU buffer index (stable secondary
+    ///            key).  Same lights that were in budget last frame keep the same
+    ///            atlas slots, preventing slot churn from minor score fluctuations.
+    ///            Only new entrants and exits cause slot reassignment.
+    ///
+    /// IMPORTANT: Camera distance is intentionally NOT used in scoring. Using
+    /// camera distance causes the budget to reshuffle every frame the camera
+    /// moves, which triggers shadow atlas re-renders (expensive with many draw
+    /// calls). The budget should only change when lights are added/removed or
+    /// their properties change — which is exactly when `flush()` calls this.
+    fn assign_shadow_casters(&mut self) {
+        const MAX_SHADOW_CASTERS: usize = 42;
+        const FACES_PER_LIGHT: u32 = 6;
+        let light_count = self.gpu_scene.lights.len();
+
+        // Phase 1: score and select the top MAX_SHADOW_CASTERS.
+        let mut scored: Vec<(f32, usize)> = Vec::with_capacity(light_count);
+        for i in 0..light_count {
+            let light = self.gpu_scene.lights.0.as_slice()[i];
+            if light.shadow_index == u32::MAX {
+                continue; // user explicitly disabled shadows on this light
+            }
+            let score = if light.light_type == 0 {
+                // Directional: infinite range, always highest priority.
+                f32::MAX
+            } else {
+                let range = light.position_range[3].max(0.001);
+                // intensity × range² — view-independent, stable across camera moves.
+                light.color_intensity[3] * (range * range)
+            };
+            scored.push((score, i));
+        }
+
+        // Sort descending by importance to determine which lights win the budget.
+        scored.sort_unstable_by(|a, b| {
+            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let winner_count = scored.len().min(MAX_SHADOW_CASTERS);
+
+        // Phase 2: re-sort winners by their buffer index (stable secondary key).
+        scored[..winner_count].sort_unstable_by_key(|&(_, i)| i);
+
+        // Assign atlas slots to winners; disable everything else.
+        let mut next_layer: u32 = 0;
+        for (rank, &(_, i)) in scored.iter().enumerate() {
+            let light = self.gpu_scene.lights.0.as_slice()[i];
+            if rank < MAX_SHADOW_CASTERS {
+                let mut assigned = light;
+                assigned.shadow_index = next_layer;
+                self.gpu_scene.lights.update(i, assigned);
+                next_layer += FACES_PER_LIGHT;
+            } else {
+                let mut disabled = light;
+                disabled.shadow_index = u32::MAX;
+                self.gpu_scene.lights.update(i, disabled);
+            }
+        }
+        let needed = (next_layer as usize).max(1);
+        if self.gpu_scene.shadow_matrices.len() != needed {
+            self.gpu_scene
+                .shadow_matrices
+                .set_data(vec![GpuShadowMatrix::zeroed(); needed]);
+        }
+    }
+
+    /// Recompute the per-caster content hashes used by ShadowPass to detect light
+    /// movement.  Each hash covers the caster light's geometry (position, range,
+    /// direction, type); directional casters additionally fold in the snapped
+    /// camera pose, since their CSM placement follows the camera.
+    ///
+    /// `cam_pos` / `cam_fwd` are the pre-snapped camera values from `flush()`, so
+    /// the hash matches the gate that decides whether to call this at all.
+    fn recompute_caster_hashes(&mut self, cam_pos: [f32; 3], cam_fwd: [f32; 3]) {
+        let light_count = self.gpu_scene.lights.len();
+        let mut new_hashes = [0u64; 42];
+
+        for i in 0..light_count {
+            let light = self.gpu_scene.lights.0.as_slice()[i];
+            if light.shadow_index == u32::MAX {
+                continue;
+            }
+            let slot = (light.shadow_index / 6) as usize;
+            if slot >= 42 {
+                continue;
+            }
+            let base_hash = fnv1a_f32s(&light.position_range)
+                ^ fnv1a_f32s(&light.direction_outer)
+                ^ (light.light_type as u64).wrapping_mul(2654435761);
+            new_hashes[slot] = if light.light_type == 0 {
+                base_hash ^ fnv1a_f32s(&cam_pos) ^ fnv1a_f32s(&cam_fwd)
+            } else {
+                base_hash
+            };
+        }
+
+        // ShadowPass detects light movement each frame by comparing this value.
+        self.gpu_scene.per_caster_dirty_gen[..42].copy_from_slice(&new_hashes);
     }
 
     /// Advance the frame counter.

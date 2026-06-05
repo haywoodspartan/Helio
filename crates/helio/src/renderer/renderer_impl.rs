@@ -1499,6 +1499,38 @@ impl Renderer {
             &frame_resources,
         )?;
 
+        // ── TEMP diagnostic: dump the hottest GPU passes ─────────────────────
+        // Set the env var `HELIO_PASS_TIMING=1` and watch stderr while dragging a
+        // light to see which pass dominates frame time.  Zero cost when unset.
+        // Remove once the bottleneck is identified.
+        {
+            use std::sync::OnceLock;
+            static PASS_TIMING: OnceLock<bool> = OnceLock::new();
+            let enabled = *PASS_TIMING.get_or_init(|| std::env::var("HELIO_PASS_TIMING").is_ok());
+            if enabled && self.scene.gpu_scene().frame_count % 15 == 0 {
+                let (mut timings, total_cpu_ms, total_gpu_ms) =
+                    self.graph.profiler().export_timings();
+                timings.sort_by(|a, b| {
+                    b.gpu_ms
+                        .partial_cmp(&a.gpu_ms)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let top: Vec<String> = timings
+                    .iter()
+                    .take(8)
+                    .filter(|t| t.gpu_ms > 0.0 || t.cpu_ms > 0.0)
+                    .map(|t| format!("{}=gpu{:.2}/cpu{:.2}ms", t.name, t.gpu_ms, t.cpu_ms))
+                    .collect();
+                eprintln!(
+                    "[pass-timing] frame {} | GPU {:.2}ms CPU {:.2}ms | top: {}",
+                    self.scene.gpu_scene().frame_count,
+                    total_gpu_ms,
+                    total_cpu_ms,
+                    top.join("  ")
+                );
+            }
+        }
+
         // Send profiling data to live portal (non-blocking)
         #[cfg(feature = "live-portal")]
         if let Some(ref portal) = self.portal_handle {
