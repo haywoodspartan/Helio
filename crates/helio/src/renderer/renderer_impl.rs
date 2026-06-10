@@ -1100,6 +1100,40 @@ impl Renderer {
         self.graph_kind = GraphKind::Default;
     }
 
+    /// Switch to the opt-in GPU-driven pipeline (unified multi-view culling +
+    /// single-pass tiled shadow atlas — see `helio-pipeline/DESIGN.md`).
+    ///
+    /// Installed as a custom graph with a rebuild closure so resizes go through
+    /// the same builder (`apply_resize_now`'s Custom branch). The default
+    /// pipeline stays available via [`use_default_graph`](Self::use_default_graph).
+    pub fn use_gpu_driven_graph(&mut self) {
+        let config = RendererConfig {
+            width: self.output_width,
+            height: self.output_height,
+            surface_format: self.surface_format,
+            gi_config: self.gi_config,
+            shadow_quality: self.shadow_quality,
+            debug_mode: self.debug_mode,
+            render_scale: self.render_scale,
+            perf_overlay_mode: self.perf_overlay_mode,
+        };
+        let graph = super::graph::build_gpu_driven_graph(
+            &self.device,
+            &self.queue,
+            &self.scene,
+            config,
+            self.debug_state.clone(),
+            &self.debug_camera_buffer,
+        );
+        self.set_graph_custom(
+            graph,
+            config,
+            std::sync::Arc::new(|d, q, s, c, ds, dcb| {
+                super::graph::build_gpu_driven_graph(d, q, s, c, ds, dcb)
+            }),
+        );
+    }
+
     pub fn optimize_scene_layout(&mut self) {
         self.scene.optimize_scene_layout();
     }

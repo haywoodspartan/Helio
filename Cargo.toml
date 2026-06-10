@@ -7,6 +7,9 @@ members = [
     "crates/helio-asset-compat",
     "crates/examples",
 
+    # GPU-driven pipeline (opt-in unified cull/shadow/geometry/lighting)
+    "crates/helio-pipeline",
+
     # GPU-driven pass crates (each O(1) CPU)
     "crates/helio-pass-sky-lut",
     "crates/helio-pass-sky",

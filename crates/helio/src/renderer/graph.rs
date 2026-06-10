@@ -18,6 +18,7 @@ use helio_pass_virtual_geometry::VirtualGeometryPass;
 use helio_pass_hlfs::HlfsPass;
 use helio_pass_perf_overlay::{PerfOverlayAnalyzerPass, PerfOverlayCostAnalyzerPass, PerfOverlayPass, PerfOverlayShared};
 use helio_pass_water_sim::WaterSimPass;
+use helio_pipeline::{CullPass, GeometryPass, LightingPass, PipelineShared, ShadowAtlasPass};
 use helio_v3::RenderGraph;
 
 use crate::scene::Scene;
@@ -379,6 +380,151 @@ pub fn build_hlfs_graph(
     )));
 
     // HLFS graph also runs its main transient resources at internal resolution.
+    graph.init_transients(config.internal_width(), config.internal_height());
+
+    graph
+}
+
+/// Opt-in GPU-driven pipeline graph (see `helio-pipeline/DESIGN.md`).
+///
+/// Replaces the classic shadow/cull prelude (ShadowMatrix → ShadowDirty →
+/// Shadow → IndirectDispatch → OcclusionCull → HiZ → LightCull → GBuffer →
+/// DeferredLight) with four GPU-driven passes: one unified multi-view cull
+/// dispatch, one single-pass tiled shadow atlas, a culled G-buffer fill, and
+/// deferred lighting against the tiled atlas. The tail (sky, VG, billboards,
+/// water, TAA, perf overlay, debug draw) is wired exactly like the default
+/// graph since GeometryPass/LightingPass publish the same frame contracts.
+pub fn build_gpu_driven_graph(
+    device: &Arc<wgpu::Device>,
+    queue: &Arc<wgpu::Queue>,
+    scene: &Scene,
+    config: RendererConfig,
+    debug_state: Arc<std::sync::Mutex<crate::renderer::debug::DebugDrawState>>,
+    debug_camera_buf: &wgpu::Buffer,
+) -> RenderGraph {
+    let gpu_scene = scene.gpu_scene();
+    let camera_buf = gpu_scene.camera.buffer();
+    let mut graph = RenderGraph::new(device, queue);
+
+    // Cross-pass pipeline state (view set, culled indirect lists, atlas).
+    let shared = PipelineShared::new(device);
+
+    // [1] Unified cull: ONE compute dispatch produces per-view indirect lists
+    // for the camera and every shadow face. [2] then renders all dirty faces
+    // in ONE render pass via per-face viewports on the tiled 2D atlas.
+    graph.add_pass(Box::new(CullPass::new(device, shared.clone())));
+    graph.add_pass(Box::new(ShadowAtlasPass::new(device, shared.clone())));
+
+    let has_sky = scene.sky_context().has_sky;
+    if has_sky {
+        let sky_lut_pass = SkyLutPass::new(device, camera_buf);
+        let sky_lut_view = sky_lut_pass.sky_lut_view.clone();
+        graph.add_pass(Box::new(sky_lut_pass));
+
+        graph.add_pass(Box::new(SkyPass::new(
+            device,
+            camera_buf,
+            &sky_lut_view,
+            config.internal_width(),
+            config.internal_height(),
+            config.surface_format,
+        )));
+    }
+
+    graph.add_pass(Box::new(DebugDrawPass::new(
+        device,
+        debug_camera_buf,
+        config.surface_format,
+        debug_state.clone(),
+        false,
+        true,
+    )));
+
+    let perf_overlay_shared = PerfOverlayShared::new(device, config.internal_width(), config.internal_height());
+    graph.add_pass(Box::new(PerfOverlayAnalyzerPass::new(Arc::clone(&perf_overlay_shared))));
+
+    // [3] G-buffer fill from the camera's culled draw list (view 0). Publishes
+    // the same frame.gbuffer contract as GBufferPass so the tail keeps working.
+    let mut geometry = GeometryPass::new(
+        device,
+        config.internal_width(),
+        config.internal_height(),
+        shared.clone(),
+    );
+    geometry.debug_mode = config.debug_mode;
+    graph.add_pass(Box::new(geometry));
+
+    let mut vg_pass = VirtualGeometryPass::new(device, camera_buf);
+    vg_pass.debug_mode = config.debug_mode;
+    graph.add_pass(Box::new(vg_pass));
+    graph.add_pass(Box::new(PerfOverlayAnalyzerPass::new(Arc::clone(&perf_overlay_shared))));
+
+    // [4] Deferred lighting sampling the tiled shadow atlas; publishes
+    // frame.pre_aa with DeferredLightPass semantics.
+    graph.add_pass(Box::new(LightingPass::new(
+        device,
+        config.internal_width(),
+        config.internal_height(),
+        config.surface_format,
+        shared.clone(),
+    )));
+    graph.add_pass(Box::new(PerfOverlayCostAnalyzerPass::new(Arc::clone(&perf_overlay_shared))));
+    graph.add_pass(Box::new(PerfOverlayAnalyzerPass::new(Arc::clone(&perf_overlay_shared))));
+
+    let spotlight = image::load_from_memory(SPOTLIGHT_PNG)
+        .unwrap_or_else(|_| image::DynamicImage::new_rgba8(1, 1))
+        .into_rgba8();
+    let (sw, sh) = spotlight.dimensions();
+    let mut billboard_pass = BillboardPass::new_with_sprite_rgba(
+        device,
+        queue,
+        camera_buf,
+        config.surface_format,
+        spotlight.as_raw(),
+        sw,
+        sh,
+    );
+    billboard_pass.set_occluded_by_geometry(true);
+    graph.add_pass(Box::new(billboard_pass));
+    graph.add_pass(Box::new(PerfOverlayAnalyzerPass::new(Arc::clone(&perf_overlay_shared))));
+
+    graph.add_pass(Box::new(WaterSimPass::new(
+        device,
+        camera_buf,
+        config.internal_width(),
+        config.internal_height(),
+        config.surface_format,
+    )));
+    graph.add_pass(Box::new(PerfOverlayAnalyzerPass::new(Arc::clone(&perf_overlay_shared))));
+
+    graph.add_pass(Box::new(TaaPass::new(
+        device,
+        config.internal_width(),
+        config.internal_height(),
+        config.width,
+        config.height,
+        config.surface_format,
+    )));
+    graph.add_pass(Box::new(PerfOverlayAnalyzerPass::new(Arc::clone(&perf_overlay_shared))));
+
+    let mut perf_overlay_pass = PerfOverlayPass::new(
+        device,
+        Arc::clone(&perf_overlay_shared),
+        config.surface_format,
+    );
+    perf_overlay_pass.set_mode(config.perf_overlay_mode);
+    graph.add_pass(Box::new(perf_overlay_pass));
+
+    graph.add_pass(Box::new(DebugDrawPass::new(
+        device,
+        debug_camera_buf,
+        config.surface_format,
+        debug_state.clone(),
+        false,
+        false,
+    )));
+
+    // Same as the default graph: transients run at internal resolution.
     graph.init_transients(config.internal_width(), config.internal_height());
 
     graph

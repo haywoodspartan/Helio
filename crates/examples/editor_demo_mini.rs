@@ -163,6 +163,15 @@ impl ApplicationHandler for App {
         renderer.set_clear_color([0.03, 0.05, 0.10, 1.0]);
         // Moonlight ambient — bright enough to read the container colours
         renderer.set_ambient([0.18, 0.22, 0.32], 0.35);
+        // Opt-in GPU-driven pipeline: HELIO_PIPELINE=gpu swaps in the unified
+        // cull + tiled shadow atlas graph; anything else keeps the default.
+        if std::env::var("HELIO_PIPELINE")
+            .map(|v| v.eq_ignore_ascii_case("gpu"))
+            .unwrap_or(false)
+        {
+            renderer.use_gpu_driven_graph();
+            log::info!("[demo] GPU-driven pipeline enabled (HELIO_PIPELINE=gpu)");
+        }
 
         // ── Scene construction ────────────────────────────────────────────
         let mut picker = ScenePicker::new();

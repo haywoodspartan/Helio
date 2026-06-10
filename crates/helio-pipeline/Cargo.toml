@@ -1,0 +1,16 @@
+[package]
+name = "helio-pipeline"
+version = "0.1.0"
+edition = "2021"
+description = "GPU-driven render pipeline for Helio: unified multi-view culling, single-pass tiled shadow atlas, culled G-buffer, deferred lighting"
+
+[dependencies]
+helio-v3 = { workspace = true }
+libhelio = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+naga = { git = "https://github.com/Far-Beyond-Pulsar/wgpu", rev = "fce5b80e8017304449124b12637ec324417e40c8", features = ["wgsl-in"] }
